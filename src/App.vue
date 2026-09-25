@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { parseFormula, type ParseResult } from './lib/parser'
+import { Fraction } from './lib/fraction'
 import { balance, type BalanceResult, type Species } from './lib/solver'
 import {
   computeStoich,
@@ -11,6 +12,16 @@ import {
   type StoichResult,
   type StoichSpecies,
 } from './lib/stoich'
+import {
+  computeFlow,
+  speciesKey,
+  type FeedInput,
+  type FlowConnectionData,
+  type FlowIssue,
+  type FlowResult,
+  type FlowSpecies,
+  type FlowStepData,
+} from './lib/flow'
 
 interface Row {
   id: number
@@ -402,6 +413,198 @@ function coefFor(side: 'left' | 'right', indexWithinSide: number): bigint | null
     }
   }
   return null
+}
+
+
+/* ---------- 多步反应流程 ---------- */
+
+let nextStepId = 1
+let nextConnId = 1
+const flowSteps = reactive<FlowStepData[]>([])
+const flowConnections = reactive<FlowConnectionData[]>([])
+const flowStale = ref(false)
+const flowOutcome = ref<{ issues: FlowIssue[]; result: FlowResult | null } | null>(null)
+
+const canSaveStep = computed(
+  () => snapshot.value !== null && snapshot.value.result.kind === 'unique' && !stale.value && !hasElectron.value,
+)
+
+function markFlowStale() {
+  if (flowOutcome.value) flowStale.value = true
+}
+
+function saveFlowStep() {
+  const snap = snapshot.value
+  if (!snap || snap.result.kind !== 'unique' || stale.value || hasElectron.value) return
+  const coef = snap.result.coefficients
+  const species: FlowSpecies[] = snap.rows.map((r, i) => ({
+    key: speciesKey(r.text),
+    label: r.text.trim(),
+    side: r.side,
+    coefficient: coef[i],
+  }))
+  const seenKeys = new Set<string>()
+  for (const sp of species) {
+    const k = sp.side + '|' + sp.key
+    if (seenKeys.has(k)) {
+      globalMessage.value = `无法保存为流程步骤：同侧存在重复物质 ${sp.key}，请先调整。`
+      return
+    }
+    seenKeys.add(k)
+  }
+  flowSteps.push({ id: nextStepId, name: `步骤 ${nextStepId}`, species, feeds: {}, molarMasses: {} })
+  nextStepId++
+  markFlowStale()
+  globalMessage.value = '已把当前反应保存为独立的流程步骤快照；此后上方工作台的修改不会影响它。'
+}
+
+function stepEquation(species: FlowSpecies[]): string {
+  const part = (sp: FlowSpecies) => (sp.coefficient === 1n ? sp.label : `${sp.coefficient}${sp.label}`)
+  const left = species.filter((sp) => sp.side === 'left').map(part).join(' + ')
+  const right = species.filter((sp) => sp.side === 'right').map(part).join(' + ')
+  return `${left} → ${right}`
+}
+
+function moveFlowStep(id: number, delta: -1 | 1) {
+  const idx = flowSteps.findIndex((s) => s.id === id)
+  const target = idx + delta
+  if (idx < 0 || target < 0 || target >= flowSteps.length) return
+  const [item] = flowSteps.splice(idx, 1)
+  flowSteps.splice(target, 0, item)
+  // 调序只改变展示顺序，不改变物质绑定与计算结果，无需失效
+}
+
+function deleteFlowStep(step: FlowStepData) {
+  const idx = flowSteps.findIndex((s) => s.id === step.id)
+  if (idx >= 0) flowSteps.splice(idx, 1)
+  for (let i = flowConnections.length - 1; i >= 0; i--) {
+    if (flowConnections[i].fromStep === step.id || flowConnections[i].toStep === step.id) {
+      flowConnections.splice(i, 1)
+    }
+  }
+  markFlowStale()
+}
+
+function feedFor(step: FlowStepData, key: string): FeedInput {
+  if (!step.feeds[key]) step.feeds[key] = { amount: '', unit: 'mol' }
+  return step.feeds[key]
+}
+
+const connForm = reactive<{ fromStep: number | null; fromKey: string; toStep: number | null; percent: string }>({
+  fromStep: null,
+  fromKey: '',
+  toStep: null,
+  percent: '',
+})
+
+const connSourceProducts = computed(
+  () => flowSteps.find((s) => s.id === connForm.fromStep)?.species.filter((sp) => sp.side === 'right') ?? [],
+)
+
+const connTargetSteps = computed(() => flowSteps.filter((s) => s.id !== connForm.fromStep))
+
+const connTargetReactants = computed(() => {
+  const target = flowSteps.find((s) => s.id === connForm.toStep)
+  if (!target || !connForm.fromKey) return []
+  return target.species.filter((sp) => sp.side === 'left' && sp.key === connForm.fromKey)
+})
+
+function addFlowConnection() {
+  const target = connTargetReactants.value[0]
+  if (connForm.fromStep === null || !connForm.fromKey || connForm.toStep === null || !target) return
+  flowConnections.push({
+    id: nextConnId++,
+    fromStep: connForm.fromStep,
+    fromKey: connForm.fromKey,
+    toStep: connForm.toStep,
+    toKey: target.key,
+    percent: connForm.percent,
+  })
+  connForm.percent = ''
+  markFlowStale()
+}
+
+function deleteFlowConnection(id: number) {
+  const idx = flowConnections.findIndex((c) => c.id === id)
+  if (idx >= 0) flowConnections.splice(idx, 1)
+  markFlowStale()
+}
+
+function stepName(id: number): string {
+  return flowSteps.find((s) => s.id === id)?.name ?? `#${id}`
+}
+
+function computeFlowAll() {
+  flowOutcome.value = computeFlow(flowSteps, flowConnections)
+  flowStale.value = false
+}
+
+const flowResultVisible = computed(() => flowOutcome.value !== null && !flowStale.value)
+
+function connIssues(id: number): FlowIssue[] {
+  if (!flowOutcome.value || flowStale.value) return []
+  return flowOutcome.value.issues.filter((i) => i.connectionId === id)
+}
+
+function stepIssues(id: number): FlowIssue[] {
+  if (!flowOutcome.value || flowStale.value) return []
+  return flowOutcome.value.issues.filter((i) => i.stepId === id)
+}
+
+const flowGlobalIssues = computed(() =>
+  !flowOutcome.value || flowStale.value
+    ? []
+    : flowOutcome.value.issues.filter((i) => i.scope === 'flow'),
+)
+
+function pctText(ratio: Fraction): string {
+  return fmt(ratio.mul(new Fraction(100n))).text
+}
+
+function loadFlowExample() {
+  flowSteps.splice(0, flowSteps.length)
+  flowConnections.splice(0, flowConnections.length)
+  flowOutcome.value = null
+  flowStale.value = false
+  const mk = (
+    name: string,
+    left: Array<[string, bigint]>,
+    right: Array<[string, bigint]>,
+    feeds: Record<string, FeedInput>,
+  ): FlowStepData => {
+    const step: FlowStepData = {
+      id: nextStepId++,
+      name,
+      species: [
+        ...left.map(([key, coefficient]) => ({ key, label: key, side: 'left' as const, coefficient })),
+        ...right.map(([key, coefficient]) => ({ key, label: key, side: 'right' as const, coefficient })),
+      ],
+      feeds,
+      molarMasses: {},
+    }
+    flowSteps.push(step)
+    return step
+  }
+  const s1 = mk(
+    '蒸汽重整',
+    [['CH4', 1n], ['H2O', 1n]],
+    [['CO', 1n], ['H2', 3n]],
+    { CH4: { amount: '2', unit: 'mol' }, H2O: { amount: '3', unit: 'mol' } },
+  )
+  const s2 = mk('甲醇合成', [['CO', 1n], ['H2', 2n]], [['CH3OH', 1n]], {})
+  const s3 = mk(
+    '电解水',
+    [['H2O', 2n]],
+    [['H2', 2n], ['O2', 1n]],
+    { H2O: { amount: '4', unit: 'mol' } },
+  )
+  flowConnections.push(
+    { id: nextConnId++, fromStep: s1.id, fromKey: 'CO', toStep: s2.id, toKey: 'CO', percent: '100' },
+    { id: nextConnId++, fromStep: s1.id, fromKey: 'H2', toStep: s2.id, toKey: 'H2', percent: '50' },
+    { id: nextConnId++, fromStep: s3.id, fromKey: 'H2', toStep: s2.id, toKey: 'H2', percent: '100' },
+  )
+  globalMessage.value =
+    '已载入多步示例（含分流与合流）：蒸汽重整的 CO 全部、H2 的 50% 送入甲醇合成，电解水的 H2 全部合流进甲醇合成。假设每步完全反应且无副反应。点击「计算全流程」查看结果。'
 }
 
 function onRowKeydown(e: KeyboardEvent, side: 'left' | 'right', id: number, index: number) {
@@ -854,6 +1057,241 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
       </template>
     </section>
 
+    <section class="flow-section" aria-label="多步反应流程">
+      <h2>多步反应流程</h2>
+      <p class="hint">
+        把上方已确认的反应保存为独立步骤快照，再把某步的生成物按比例分配给后续步骤的反应物（分流 / 合流）。
+        假设每步反应完全进行且无副反应；全流程使用精确有理数计算，仅显示时舍入。
+      </p>
+      <div class="actions">
+        <button type="button" class="balance-btn" :disabled="!canSaveStep" @click="saveFlowStep">
+          保存当前反应为流程步骤
+        </button>
+        <button type="button" class="example-btn" @click="loadFlowExample">载入多步示例（分流 + 合流）</button>
+        <span v-if="!canSaveStep" class="hint">需先配平出唯一全正解且不含电子 e^-，才能保存为步骤。</span>
+      </div>
+
+      <div v-if="flowSteps.length === 0" class="hint">还没有流程步骤。</div>
+
+      <div v-for="(step, si) in flowSteps" :key="step.id" class="flow-step">
+        <div class="flow-step-head">
+          <input v-model="step.name" class="plan-name-input" :aria-label="'步骤 ' + (si + 1) + ' 名称'" @input="markFlowStale" />
+          <span class="flow-eq">{{ stepEquation(step.species) }}</span>
+          <span class="row-tools">
+            <button type="button" :disabled="si === 0" @click="moveFlowStep(step.id, -1)">↑</button>
+            <button type="button" :disabled="si === flowSteps.length - 1" @click="moveFlowStep(step.id, 1)">↓</button>
+            <button type="button" @click="deleteFlowStep(step)">删除步骤</button>
+          </span>
+        </div>
+        <p v-for="issue in stepIssues(step.id)" :key="issue.message" class="error" role="alert">{{ issue.message }}</p>
+        <table class="stoich-table">
+          <thead>
+            <tr>
+              <th>物质</th>
+              <th>系数</th>
+              <th>外部补料</th>
+              <th>单位</th>
+              <th>摩尔质量 (g/mol，选填)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="sp in step.species" :key="sp.side + sp.key">
+              <td>
+                <span class="side-tag">{{ sp.side === 'left' ? '反应物' : '生成物' }}</span>
+                {{ sp.label }}
+              </td>
+              <td>{{ sp.coefficient }}</td>
+              <template v-if="sp.side === 'left'">
+                <td>
+                  <input
+                    v-model="feedFor(step, sp.key).amount"
+                    class="amount-input"
+                    :aria-label="step.name + ' ' + sp.label + ' 补料数量'"
+                    placeholder="0（可留空）"
+                    @input="markFlowStale"
+                  />
+                </td>
+                <td>
+                  <select
+                    v-model="feedFor(step, sp.key).unit"
+                    :aria-label="step.name + ' ' + sp.label + ' 单位'"
+                    @change="markFlowStale"
+                  >
+                    <option v-for="(label, u) in unitLabels" :key="u" :value="u">{{ label }}</option>
+                  </select>
+                </td>
+              </template>
+              <template v-else>
+                <td colspan="2" class="hint">生成物无需补料</td>
+              </template>
+              <td>
+                <input
+                  v-model="step.molarMasses[sp.key]"
+                  class="amount-input"
+                  :aria-label="step.name + ' ' + sp.label + ' 摩尔质量'"
+                  placeholder="选填"
+                  @input="markFlowStale"
+                />
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <template v-if="flowSteps.length > 0">
+        <h3>流程连接（生成物 → 反应物，按产量百分比分配）</h3>
+        <table v-if="flowConnections.length > 0" class="stoich-table">
+          <thead>
+            <tr>
+              <th>来源生成物</th>
+              <th>目标反应物</th>
+              <th>分配比例 (%)</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="c in flowConnections" :key="c.id" :class="{ invalid: connIssues(c.id).length > 0 }">
+              <td>{{ stepName(c.fromStep) }} · {{ c.fromKey }}</td>
+              <td>{{ stepName(c.toStep) }} · {{ c.toKey }}</td>
+              <td>
+                <input
+                  v-model="c.percent"
+                  class="amount-input percent-input"
+                  :aria-label="'连接 ' + c.fromKey + ' 分配比例'"
+                  @input="markFlowStale"
+                />
+                <p v-for="issue in connIssues(c.id)" :key="issue.message" class="error" role="alert">{{ issue.message }}</p>
+              </td>
+              <td><button type="button" @click="deleteFlowConnection(c.id)">删除</button></td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="hint">还没有连接。未连接的生成物全部留存；剩余反应物不会自动转送。</p>
+
+        <div class="conn-form">
+          <select v-model="connForm.fromStep" aria-label="来源步骤" @change="connForm.fromKey = ''">
+            <option :value="null" disabled>来源步骤</option>
+            <option v-for="s in flowSteps" :key="s.id" :value="s.id">{{ s.name }}</option>
+          </select>
+          <select v-model="connForm.fromKey" aria-label="来源生成物" :disabled="connSourceProducts.length === 0">
+            <option value="" disabled>生成物</option>
+            <option v-for="sp in connSourceProducts" :key="sp.key" :value="sp.key">{{ sp.label }}</option>
+          </select>
+          <span aria-hidden="true">→</span>
+          <select v-model="connForm.toStep" aria-label="目标步骤">
+            <option :value="null" disabled>目标步骤</option>
+            <option v-for="s in connTargetSteps" :key="s.id" :value="s.id">{{ s.name }}</option>
+          </select>
+          <select aria-label="目标反应物" :disabled="connTargetReactants.length === 0" :value="connTargetReactants[0]?.key ?? ''">
+            <option v-if="connTargetReactants.length === 0" value="" disabled>无同式反应物</option>
+            <option v-for="sp in connTargetReactants" :key="sp.key" :value="sp.key">{{ sp.label }}</option>
+          </select>
+          <input
+            v-model="connForm.percent"
+            class="amount-input percent-input"
+            aria-label="分配比例百分比"
+            placeholder="比例 % (0,100]"
+          />
+          <button
+            type="button"
+            :disabled="connForm.fromStep === null || !connForm.fromKey || connForm.toStep === null || connTargetReactants.length === 0"
+            @click="addFlowConnection"
+          >
+            + 添加连接
+          </button>
+        </div>
+        <p class="hint">只允许连接去掉空白后化学式相同的物质；同一生成物各连接比例之和不得超过 100%，未分配部分留存。</p>
+
+        <div class="actions">
+          <button type="button" class="balance-btn" @click="computeFlowAll">计算全流程</button>
+          <span class="hint">任一编辑都会使旧结果失效；全部校验通过后才会发布完整结果。</span>
+        </div>
+      </template>
+
+      <p v-if="flowOutcome && flowStale" class="banner warn" role="status">
+        步骤、补料或连接已修改，整套流程结果已失效，请重新点击「计算全流程」。
+      </p>
+
+      <template v-if="flowResultVisible && flowOutcome">
+        <p v-for="issue in flowGlobalIssues" :key="issue.message" class="banner bad" role="alert">{{ issue.message }}</p>
+        <div v-if="flowOutcome.issues.length > 0" class="banner bad" role="alert">
+          流程校验未通过（{{ flowOutcome.issues.length }} 处问题，见各步骤 / 连接下方标注），本次不发布结果。
+        </div>
+
+        <template v-if="flowOutcome.result">
+          <div v-for="acct in flowOutcome.result.steps" :key="acct.stepId" class="flow-account">
+            <h3>
+              {{ acct.name }}
+              <span class="hint">（反应进度 ξ = {{ fmt(acct.extent).text }} mol）</span>
+            </h3>
+            <table class="stoich-table">
+              <thead>
+                <tr>
+                  <th>反应物</th>
+                  <th>外部补料 (mol)</th>
+                  <th>上游送入 (mol)</th>
+                  <th>可用 (mol)</th>
+                  <th>消耗 (mol)</th>
+                  <th>剩余 (mol)</th>
+                  <th>剩余质量 (g)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="r in acct.reactants" :key="r.key" :class="{ limiting: r.limiting }">
+                  <td>
+                    {{ r.label }}
+                    <span v-if="r.limiting" class="side-tag">限量</span>
+                  </td>
+                  <td>{{ fmt(r.feedMol).text }}</td>
+                  <td>
+                    <template v-if="r.incoming.length > 0">
+                      <div v-for="t in r.incoming" :key="t.connectionId">
+                        来自「{{ stepName(t.fromStepId) }}」{{ t.fromKey }}：{{ fmt(t.mol).text }}
+                      </div>
+                    </template>
+                    <template v-else>—</template>
+                  </td>
+                  <td>{{ fmt(r.available).text }}</td>
+                  <td>{{ fmt(r.consumed).text }}</td>
+                  <td>{{ fmt(r.remaining).text }}</td>
+                  <td>{{ r.remainingMass ? fmt(r.remainingMass).text : '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <table class="stoich-table">
+              <thead>
+                <tr>
+                  <th>生成物</th>
+                  <th>产量 (mol)</th>
+                  <th>产量 (g)</th>
+                  <th>已转送 (mol)</th>
+                  <th>转送明细</th>
+                  <th>留存 (mol)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="pr in acct.products" :key="pr.key">
+                  <td>{{ pr.label }}</td>
+                  <td>{{ fmt(pr.produced).text }}</td>
+                  <td>{{ pr.producedMass ? fmt(pr.producedMass).text : '—' }}</td>
+                  <td>{{ fmt(pr.transferred).text }}</td>
+                  <td>
+                    <template v-if="pr.transfers.length > 0">
+                      <div v-for="t in pr.transfers" :key="t.connectionId">
+                        → 「{{ stepName(t.toStepId) }}」{{ fmt(t.mol).text }}（{{ pctText(t.ratio) }}%）
+                      </div>
+                    </template>
+                    <template v-else>—</template>
+                  </td>
+                  <td>{{ fmt(pr.retained).text }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+      </template>
+    </section>
+
     <section class="syntax-help">
       <h2>输入语法</h2>
       <ul>
@@ -1262,6 +1700,75 @@ button:disabled {
 
 .limiting-line {
   font-size: 16px;
+}
+
+
+.flow-section {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin: 16px 0;
+}
+
+.flow-section h2 {
+  margin-top: 0;
+  font-size: 18px;
+}
+
+.flow-section h3 {
+  font-size: 15px;
+  margin: 14px 0 6px;
+}
+
+.flow-step {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 10px 0;
+}
+
+.flow-step-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.flow-eq {
+  font-family: 'Cambria Math', 'Times New Roman', serif;
+  font-size: 16px;
+  color: #1e40af;
+}
+
+.conn-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.conn-form select {
+  font: inherit;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.percent-input {
+  width: 130px;
+}
+
+.stoich-table tr.invalid {
+  background: var(--danger-soft);
+}
+
+.flow-account {
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+  margin-top: 10px;
 }
 
 .syntax-help h2 {
