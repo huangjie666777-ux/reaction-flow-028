@@ -11,6 +11,17 @@ import {
   type StoichResult,
   type StoichSpecies,
 } from './lib/stoich'
+import {
+  computeFlow,
+  normalizeFormulaText,
+  stepProducts,
+  stepReactants,
+  validateFlow,
+  type FlowConnection,
+  type FlowFeed,
+  type FlowStep,
+  type StepAccount,
+} from './lib/flow'
 
 interface Row {
   id: number
@@ -437,6 +448,245 @@ function onGlobalKey(e: KeyboardEvent) {
 
 onMounted(() => window.addEventListener('keydown', onGlobalKey))
 onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
+
+/* ---------- 多步反应流程 ---------- */
+
+let nextStepId = 1
+let nextConnId = 1
+const flowSteps = reactive<FlowStep[]>([])
+const flowConnections = reactive<FlowConnection[]>([])
+const flowResult = ref<{ order: number[]; accounts: Map<number, StepAccount> } | null>(null)
+const flowStale = ref(false)
+
+const canSaveStep = computed(
+  () => snapshot.value !== null && snapshot.value.result.kind === 'unique' && !stale.value && !hasElectron.value,
+)
+
+function markFlowStale() {
+  flowStale.value = true
+}
+
+function saveAsStep() {
+  const snap = snapshot.value
+  if (!snap || snap.result.kind !== 'unique' || stale.value || hasElectron.value) return
+  const step: FlowStep = {
+    id: nextStepId++,
+    name: '步骤 ' + nextStepId,
+    rows: snap.rows.map((r) => ({ side: r.side, text: r.text })),
+    coefficients: [...snap.result.coefficients],
+    feeds: {},
+  }
+  step.name = '步骤 ' + step.id
+  flowSteps.push(step)
+  markFlowStale()
+  globalMessage.value = `已保存为「${step.name}」。此后修改上方工作台不会影响该步骤。`
+}
+
+function deleteStep(step: FlowStep) {
+  const idx = flowSteps.findIndex((s) => s.id === step.id)
+  if (idx >= 0) flowSteps.splice(idx, 1)
+  for (let i = flowConnections.length - 1; i >= 0; i--) {
+    if (flowConnections[i].fromStep === step.id || flowConnections[i].toStep === step.id) {
+      flowConnections.splice(i, 1)
+    }
+  }
+  markFlowStale()
+}
+
+function moveStep(step: FlowStep, delta: -1 | 1) {
+  const idx = flowSteps.findIndex((s) => s.id === step.id)
+  const target = idx + delta
+  if (idx < 0 || target < 0 || target >= flowSteps.length) return
+  const [item] = flowSteps.splice(idx, 1)
+  flowSteps.splice(target, 0, item)
+  // 调序只改变展示顺序，不改变物质绑定与计算结果，无需令结果失效
+}
+
+function stepFeed(step: FlowStep, rowIndex: number): FlowFeed {
+  if (!step.feeds[rowIndex]) step.feeds[rowIndex] = { amount: '', unit: 'mol', molarMass: '' }
+  return step.feeds[rowIndex]
+}
+
+function stepEquation(step: FlowStep): string {
+  const parts = step.rows.map((r, i) => {
+    const c = step.coefficients[i]
+    return c === 1n ? r.text : `${c}${r.text.replace(/\s+/g, '')}`
+  })
+  const left = parts.filter((_, i) => step.rows[i].side === 'left').join(' + ')
+  const right = parts.filter((_, i) => step.rows[i].side === 'right').join(' + ')
+  return `${left} → ${right}`
+}
+
+function stepById(id: number): FlowStep | undefined {
+  return flowSteps.find((s) => s.id === id)
+}
+
+function stepName(id: number): string {
+  return stepById(id)?.name ?? `#${id}`
+}
+
+/** 目标步骤中可与该连接生成物匹配的反应物选项 */
+function matchingReactants(conn: FlowConnection): string[] {
+  const to = stepById(conn.toStep)
+  if (!to) return []
+  return stepReactants(to).filter((r) => r === conn.product)
+}
+
+function addConnection() {
+  const from = flowSteps[0]
+  const to = flowSteps.find((s) => s.id !== from?.id)
+  if (!from || !to) return
+  const product = stepProducts(from)[0] ?? ''
+  const reactant = stepReactants(to).find((r) => r === product) ?? ''
+  flowConnections.push({
+    id: nextConnId++,
+    fromStep: from.id,
+    product,
+    toStep: to.id,
+    reactant,
+    percent: '',
+  })
+  markFlowStale()
+}
+
+function onConnFromChange(conn: FlowConnection) {
+  const from = stepById(conn.fromStep)
+  conn.product = from ? (stepProducts(from)[0] ?? '') : ''
+  onConnProductChange(conn)
+}
+
+function onConnToChange(conn: FlowConnection) {
+  const to = stepById(conn.toStep)
+  conn.reactant = to ? (stepReactants(to).find((r) => r === conn.product) ?? '') : ''
+}
+
+function onConnProductChange(conn: FlowConnection) {
+  const matches = matchingReactants(conn)
+  conn.reactant = matches.includes(conn.reactant) ? conn.reactant : (matches[0] ?? '')
+}
+
+function removeConnection(conn: FlowConnection) {
+  const idx = flowConnections.findIndex((c) => c.id === conn.id)
+  if (idx >= 0) flowConnections.splice(idx, 1)
+  markFlowStale()
+}
+
+const flowIssues = computed(() => validateFlow(flowSteps, flowConnections))
+
+const flowResultValid = computed(() => flowResult.value !== null && !flowStale.value)
+
+function computeWholeFlow() {
+  if (flowIssues.value.length > 0 || flowSteps.length === 0) return
+  flowResult.value = computeFlow(flowSteps, flowConnections)
+  flowStale.value = false
+}
+
+function accountFor(stepId: number): StepAccount | null {
+  if (!flowResultValid.value) return null
+  return flowResult.value!.accounts.get(stepId) ?? null
+}
+
+function feedErrors(account: StepAccount | null, rowIndex: number, field: 'amount' | 'molarMass'): string[] {
+  if (!account) return []
+  const r = account.reactants.find((x) => x.rowIndex === rowIndex)
+  const p = account.products.find((x) => x.rowIndex === rowIndex)
+  const errs = [...(r?.errors ?? []), ...(p?.errors ?? [])]
+  return errs.filter((e) => e.field === field).map((e) => e.message)
+}
+
+/** 含分流与合流的示例：两步各自产氢（合流）→ 合成氨 → 氨分流氧化/中和。 */
+function loadFlowExample() {
+  flowSteps.splice(0, flowSteps.length)
+  flowConnections.splice(0, flowConnections.length)
+  const mk = (
+    name: string,
+    rows: Array<['left' | 'right', string]>,
+    coefficients: bigint[],
+    feeds: Record<number, FlowFeed>,
+  ): FlowStep => {
+    const step: FlowStep = {
+      id: nextStepId++,
+      name,
+      rows: rows.map(([side, text]) => ({ side, text })),
+      coefficients,
+      feeds,
+    }
+    flowSteps.push(step)
+    return step
+  }
+  const s1 = mk(
+    '制氢 A（锌）',
+    [
+      ['left', 'Zn'],
+      ['left', 'HCl'],
+      ['right', 'ZnCl2'],
+      ['right', 'H2'],
+    ],
+    [1n, 2n, 1n, 1n],
+    { 0: { amount: '1', unit: 'mol', molarMass: '' }, 1: { amount: '2', unit: 'mol', molarMass: '' } },
+  )
+  const s2 = mk(
+    '制氢 B（铁）',
+    [
+      ['left', 'Fe'],
+      ['left', 'HCl'],
+      ['right', 'FeCl2'],
+      ['right', 'H2'],
+    ],
+    [1n, 2n, 1n, 1n],
+    { 0: { amount: '1', unit: 'mol', molarMass: '' }, 1: { amount: '2', unit: 'mol', molarMass: '' } },
+  )
+  const s3 = mk(
+    '合成氨',
+    [
+      ['left', 'N2'],
+      ['left', 'H2'],
+      ['right', 'NH3'],
+    ],
+    [1n, 3n, 2n],
+    { 0: { amount: '0.5', unit: 'mol', molarMass: '' }, 1: { amount: '0', unit: 'mol', molarMass: '' } },
+  )
+  const s4 = mk(
+    '氨氧化',
+    [
+      ['left', 'NH3'],
+      ['left', 'O2'],
+      ['right', 'NO'],
+      ['right', 'H2O'],
+    ],
+    [4n, 5n, 4n, 6n],
+    { 0: { amount: '0', unit: 'mol', molarMass: '' }, 1: { amount: '1', unit: 'mol', molarMass: '' } },
+  )
+  const s5 = mk(
+    '氨中和',
+    [
+      ['left', 'NH3'],
+      ['left', 'HCl'],
+      ['right', 'NH4Cl'],
+    ],
+    [1n, 1n, 1n],
+    { 0: { amount: '0', unit: 'mol', molarMass: '' }, 1: { amount: '1', unit: 'mol', molarMass: '' } },
+  )
+  const link = (from: FlowStep, product: string, to: FlowStep, percent: string) => {
+    flowConnections.push({
+      id: nextConnId++,
+      fromStep: from.id,
+      product,
+      toStep: to.id,
+      reactant: product,
+      percent,
+    })
+  }
+  // 合流：两步的 H2 全部送入合成氨
+  link(s1, 'H2', s3, '100')
+  link(s2, 'H2', s3, '100')
+  // 分流：NH3 60% 氧化、30% 中和，其余 10% 留存
+  link(s3, 'NH3', s4, '60')
+  link(s3, 'NH3', s5, '30')
+  markFlowStale()
+  globalMessage.value =
+    '已载入多步流程示例（假设每步完全反应且无副反应）：制氢 A/B 的 H2 合流进入合成氨，NH3 按 60%/30% 分流到氧化与中和，剩余 10% 留存。点击「计算全流程」查看逐步物料账。'
+}
 </script>
 
 <template>
@@ -854,6 +1104,234 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
       </template>
     </section>
 
+    <section class="flow-section" aria-label="多步反应流程">
+      <h2>多步反应流程</h2>
+      <p class="hint">
+        把已确认的配平结果保存为独立步骤快照（此后修改上方工作台不影响步骤），用连接把某步的生成物按比例送入另一步的同名反应物，再统一计算逐步物料账。假设每步完全反应且无副反应。
+      </p>
+      <div class="actions">
+        <button type="button" class="balance-btn" :disabled="!canSaveStep" @click="saveAsStep">
+          将当前配平结果保存为流程步骤
+        </button>
+        <button type="button" class="example-btn" @click="loadFlowExample">
+          载入流程示例（分流 + 合流）
+        </button>
+        <span v-if="!canSaveStep" class="hint">
+          需先得到唯一全正配平结果且不含电子 e^-，才能保存为步骤。
+        </span>
+      </div>
+
+      <div v-if="flowSteps.length === 0" class="hint">还没有流程步骤。</div>
+
+      <div v-for="(step, sIdx) in flowSteps" :key="step.id" class="step-card">
+        <div class="step-head">
+          <input v-model="step.name" class="plan-name-input" :aria-label="'步骤名称 ' + (sIdx + 1)" @input="markFlowStale" />
+          <pre class="equation step-equation">{{ stepEquation(step) }}</pre>
+          <div class="row-tools">
+            <button type="button" :disabled="sIdx === 0" @click="moveStep(step, -1)">↑</button>
+            <button type="button" :disabled="sIdx === flowSteps.length - 1" @click="moveStep(step, 1)">↓</button>
+            <button type="button" @click="deleteStep(step)">删除步骤</button>
+          </div>
+        </div>
+
+        <table class="stoich-table">
+          <thead>
+            <tr>
+              <th>物质</th>
+              <th>系数</th>
+              <th>外部补料</th>
+              <th>单位</th>
+              <th>摩尔质量 (g/mol，选填)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(row, rowIndex) in step.rows" :key="rowIndex">
+              <td>
+                <span class="side-tag">{{ row.side === 'left' ? '反应物' : '生成物' }}</span>
+                {{ row.text }}
+              </td>
+              <td>{{ step.coefficients[rowIndex] }}</td>
+              <template v-if="row.side === 'left'">
+                <td>
+                  <input
+                    v-model="stepFeed(step, rowIndex).amount"
+                    class="amount-input"
+                    :class="{ invalid: feedErrors(accountFor(step.id), rowIndex, 'amount').length > 0 }"
+                    :aria-label="step.name + ' ' + row.text + ' 补料数量'"
+                    placeholder="0"
+                    @input="markFlowStale"
+                  />
+                  <p v-for="err in feedErrors(accountFor(step.id), rowIndex, 'amount')" :key="err" class="error" role="alert">
+                    {{ err }}
+                  </p>
+                </td>
+                <td>
+                  <select
+                    v-model="stepFeed(step, rowIndex).unit"
+                    :aria-label="step.name + ' ' + row.text + ' 单位'"
+                    @change="markFlowStale"
+                  >
+                    <option v-for="(label, u) in unitLabels" :key="u" :value="u">{{ label }}</option>
+                  </select>
+                </td>
+              </template>
+              <template v-else>
+                <td colspan="2" class="hint">生成物无需补料</td>
+              </template>
+              <td>
+                <input
+                  v-model="stepFeed(step, rowIndex).molarMass"
+                  class="amount-input"
+                  :class="{ invalid: feedErrors(accountFor(step.id), rowIndex, 'molarMass').length > 0 }"
+                  :aria-label="step.name + ' ' + row.text + ' 摩尔质量'"
+                  placeholder="选填"
+                  @input="markFlowStale"
+                />
+                <p v-for="err in feedErrors(accountFor(step.id), rowIndex, 'molarMass')" :key="err" class="error" role="alert">
+                  {{ err }}
+                </p>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="hint">补料为外部投料，可填 0 或留空（视为 0）；上游送入量由连接自动汇入，剩余反应物不会自动转送。</p>
+      </div>
+
+      <h3>流程连接（生成物 → 同名反应物）</h3>
+      <div v-if="flowConnections.length === 0" class="hint">还没有连接。至少需要两个步骤才能连接。</div>
+      <div v-for="conn in flowConnections" :key="conn.id" class="conn-row">
+        <select v-model="conn.fromStep" :aria-label="'连接 ' + conn.id + ' 来源步骤'" @change="onConnFromChange(conn); markFlowStale()">
+          <option v-for="s in flowSteps" :key="s.id" :value="s.id">{{ s.name }}</option>
+        </select>
+        <select v-model="conn.product" :aria-label="'连接 ' + conn.id + ' 生成物'" @change="onConnProductChange(conn); markFlowStale()">
+          <option v-for="p in stepProducts(stepById(conn.fromStep) ?? { rows: [], coefficients: [], feeds: {}, id: -1, name: '' })" :key="p" :value="p">{{ p }}</option>
+        </select>
+        <span class="conn-arrow">→</span>
+        <select v-model="conn.toStep" :aria-label="'连接 ' + conn.id + ' 目标步骤'" @change="onConnToChange(conn); markFlowStale()">
+          <option v-for="s in flowSteps" :key="s.id" :value="s.id">{{ s.name }}</option>
+        </select>
+        <select v-model="conn.reactant" :aria-label="'连接 ' + conn.id + ' 反应物'" @change="markFlowStale">
+          <option v-for="r in matchingReactants(conn)" :key="r" :value="r">{{ r }}</option>
+        </select>
+        <label>
+          比例 %
+          <input
+            v-model="conn.percent"
+            class="percent-input"
+            :aria-label="'连接 ' + conn.id + ' 分配比例'"
+            placeholder="0 < p ≤ 100"
+            @input="markFlowStale"
+          />
+        </label>
+        <button type="button" @click="removeConnection(conn)">删除连接</button>
+      </div>
+      <button type="button" class="add-btn" :disabled="flowSteps.length < 2" @click="addConnection">
+        + 添加连接
+      </button>
+
+      <div v-if="flowIssues.length > 0" class="banner bad" role="alert">
+        <strong>流程校验未通过：</strong>
+        <ul class="issue-list">
+          <li v-for="(issue, i) in flowIssues" :key="i">
+            <template v-if="issue.stepId">[步骤：{{ stepName(issue.stepId) }}]</template>
+            <template v-if="issue.connectionId">[连接 #{{ issue.connectionId }}]</template>
+            {{ issue.message }}
+          </li>
+        </ul>
+      </div>
+
+      <div class="actions">
+        <button
+          type="button"
+          class="balance-btn"
+          :disabled="flowSteps.length === 0 || flowIssues.length > 0"
+          @click="computeWholeFlow"
+        >
+          计算全流程
+        </button>
+        <span class="hint">校验全部通过后才能计算；任何步骤、补料或连接的修改都会使整套旧结果失效。</span>
+      </div>
+
+      <p v-if="flowResult && flowStale" class="banner warn" role="status">
+        步骤、补料或连接已修改，以下整套流程结果已失效，请重新计算。
+      </p>
+
+      <div v-if="flowResult && flowResultValid" class="flow-results">
+        <div v-for="stepId in flowResult.order" :key="stepId" class="step-result">
+          <h3>{{ stepName(stepId) }}：{{ stepEquation(stepById(stepId)!) }}</h3>
+          <template v-if="accountFor(stepId)">
+            <div v-if="accountFor(stepId)!.hasError" class="banner bad" role="alert">
+              该步骤补料输入存在错误，请修正后重新计算。
+            </div>
+            <template v-else>
+              <p class="limiting-line">
+                <strong>限量试剂：</strong>{{ accountFor(stepId)!.limiting.join('、') || '—' }}
+                （反应进度 ξ = {{ fmt(accountFor(stepId)!.extent).text }} mol）
+              </p>
+              <h4>反应物物料账（mol）</h4>
+              <table class="stoich-table">
+                <thead>
+                  <tr>
+                    <th>物质</th>
+                    <th>外部补料</th>
+                    <th>上游送入</th>
+                    <th>可用量</th>
+                    <th>消耗</th>
+                    <th>剩余（留存，不转送）</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="r in accountFor(stepId)!.reactants" :key="r.rowIndex">
+                    <td>{{ r.label }}</td>
+                    <td>{{ fmt(r.feedMol).text }}</td>
+                    <td>
+                      <template v-if="r.incoming.length > 0">
+                        <div v-for="inc in r.incoming" :key="inc.connectionId">
+                          {{ fmt(inc.mol).text }}（来自 {{ stepName(inc.fromStepId) }}）
+                        </div>
+                      </template>
+                      <template v-else>0</template>
+                    </td>
+                    <td>{{ fmt(r.available).text }}</td>
+                    <td>{{ fmt(r.consumed).text }}</td>
+                    <td>{{ fmt(r.remaining).text }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <h4>生成物物料账（mol）</h4>
+              <table class="stoich-table">
+                <thead>
+                  <tr>
+                    <th>物质</th>
+                    <th>产量</th>
+                    <th>产量 (g)</th>
+                    <th>已转送</th>
+                    <th>留存</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="p in accountFor(stepId)!.products" :key="p.rowIndex">
+                    <td>{{ p.label }}</td>
+                    <td>{{ fmt(p.produced).text }}</td>
+                    <td>{{ p.producedMass ? fmt(p.producedMass).text : '—' }}</td>
+                    <td>
+                      <template v-if="p.transfers.length > 0">
+                        <div v-for="t in p.transfers" :key="t.connectionId">
+                          {{ fmt(t.mol).text }}（{{ fmt(t.percent).text }}% → {{ stepName(t.toStepId) }}）
+                        </div>
+                      </template>
+                      <template v-else>0</template>
+                    </td>
+                    <td>{{ fmt(p.retained).text }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+          </template>
+        </div>
+      </div>
+    </section>
+
     <section class="syntax-help">
       <h2>输入语法</h2>
       <ul>
@@ -1267,6 +1745,85 @@ button:disabled {
 .syntax-help h2 {
   margin-top: 0;
   font-size: 17px;
+}
+
+.flow-section {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin: 16px 0;
+}
+
+.flow-section h2 {
+  margin-top: 0;
+  font-size: 18px;
+}
+
+.flow-section h3 {
+  font-size: 15px;
+  margin: 14px 0 6px;
+}
+
+.flow-section h4 {
+  font-size: 14px;
+  margin: 10px 0 4px;
+}
+
+.step-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 12px 0;
+  background: #fbfcfe;
+}
+
+.step-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.step-equation {
+  margin: 0;
+  font-size: 15px;
+  padding: 6px 10px;
+  flex: 1;
+  min-width: 220px;
+}
+
+.conn-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.conn-arrow {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.percent-input {
+  width: 110px;
+  font: inherit;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.issue-list {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+
+.step-result {
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+  margin-top: 8px;
 }
 
 .syntax-help ul {

@@ -160,3 +160,106 @@ describe('投料方案', () => {
     expect(wrapper.find('.stoich-section .banner.info').text()).toContain('不适用')
   })
 })
+
+describe('多步反应流程', () => {
+  it('保存当前配平为步骤快照，且之后修改工作台不影响步骤', async () => {
+    const wrapper = mount(App, { attachTo: document.body })
+    await wrapper.find('.balance-btn').trigger('click')
+    await wrapper.vm.$nextTick()
+    const saveBtn = wrapper
+      .findAll('.flow-section button')
+      .find((b) => b.text().includes('保存为流程步骤'))!
+    await saveBtn.trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findAll('.step-card').length).toBe(1)
+    expect(wrapper.find('.step-equation').text().replace(/\s+/g, '')).toContain('2H2+O2→2H2O')
+    // 修改工作台输入，步骤快照不变
+    const input = wrapper.find('[data-side="left"] .formula-input')
+    await input.setValue('CH4')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.step-equation').text()).toContain('H2')
+  })
+
+  it('载入分流+合流示例并计算，展示逐步物料账', async () => {
+    const wrapper = mount(App, { attachTo: document.body })
+    const exampleBtn = wrapper
+      .findAll('.flow-section button')
+      .find((b) => b.text().includes('载入流程示例'))!
+    await exampleBtn.trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findAll('.step-card').length).toBe(5)
+    expect(wrapper.findAll('.conn-row').length).toBe(4)
+    const computeBtn = wrapper
+      .findAll('.flow-section .balance-btn')
+      .find((b) => b.text().includes('计算全流程'))!
+    expect(computeBtn.attributes('disabled')).toBeUndefined()
+    await computeBtn.trigger('click')
+    await wrapper.vm.$nextTick()
+    const results = wrapper.findAll('.step-result')
+    expect(results.length).toBe(5)
+    // 合成氨步骤：H2 可用量 2 mol（1+1 合流），NH3 产量 1 mol
+    const ammonia = results.find((r) => r.find('h3').text().includes('合成氨'))!
+    expect(ammonia.text()).toContain('限量试剂')
+    expect(ammonia.text()).toContain('N2')
+    // 分流：60% 与 30% 出现在已转送列
+    expect(ammonia.text()).toContain('60')
+    expect(ammonia.text()).toContain('30')
+  })
+
+  it('编辑连接后整套旧结果失效', async () => {
+    const wrapper = mount(App, { attachTo: document.body })
+    const exampleBtn = wrapper
+      .findAll('.flow-section button')
+      .find((b) => b.text().includes('载入流程示例'))!
+    await exampleBtn.trigger('click')
+    await wrapper.vm.$nextTick()
+    const computeBtn = wrapper
+      .findAll('.flow-section .balance-btn')
+      .find((b) => b.text().includes('计算全流程'))!
+    await computeBtn.trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.flow-results').exists()).toBe(true)
+    const percent = wrapper.find('.percent-input')
+    await percent.setValue('90')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.flow-results').exists()).toBe(false)
+    expect(wrapper.find('.flow-section .banner.warn').text()).toContain('已失效')
+  })
+
+  it('删除步骤同时移除关联连接', async () => {
+    const wrapper = mount(App, { attachTo: document.body })
+    const exampleBtn = wrapper
+      .findAll('.flow-section button')
+      .find((b) => b.text().includes('载入流程示例'))!
+    await exampleBtn.trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findAll('.conn-row').length).toBe(4)
+    const deleteBtn = wrapper
+      .findAll('.step-card')[2]
+      .findAll('button')
+      .find((b) => b.text() === '删除步骤')!
+    await deleteBtn.trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findAll('.step-card').length).toBe(4)
+    // 合成氨的 4 条连接中，入 2 条出 2 条全部移除
+    expect(wrapper.findAll('.conn-row').length).toBe(0)
+  })
+
+  it('比例校验失败时禁止计算并定位提示', async () => {
+    const wrapper = mount(App, { attachTo: document.body })
+    const exampleBtn = wrapper
+      .findAll('.flow-section button')
+      .find((b) => b.text().includes('载入流程示例'))!
+    await exampleBtn.trigger('click')
+    await wrapper.vm.$nextTick()
+    const percents = wrapper.findAll('.percent-input')
+    await percents[2].setValue('80')
+    await percents[3].setValue('50')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.flow-section .banner.bad').text()).toContain('超过 100')
+    const computeBtn = wrapper
+      .findAll('.flow-section .balance-btn')
+      .find((b) => b.text().includes('计算全流程'))!
+    expect(computeBtn.attributes('disabled')).toBeDefined()
+  })
+})
